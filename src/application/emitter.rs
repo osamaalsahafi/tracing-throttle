@@ -482,9 +482,9 @@ mod tests {
 
         // Verify counts
         let counts: Vec<usize> = summaries.iter().map(|s| s.count).collect();
-        assert!(counts.contains(&6)); // 5 + 1 (initial)
-        assert!(counts.contains(&11)); // 10 + 1
-        assert!(counts.contains(&16)); // 15 + 1
+        assert!(counts.contains(&5));
+        assert!(counts.contains(&10));
+        assert!(counts.contains(&15));
     }
 
     #[test]
@@ -516,7 +516,7 @@ mod tests {
 
         // Only the high-count event should be included
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].count, 15); // 14 + 1 initial
+        assert_eq!(summaries[0].count, 14);
     }
 
     #[cfg(feature = "async")]

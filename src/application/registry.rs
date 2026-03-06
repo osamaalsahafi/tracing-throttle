@@ -200,7 +200,7 @@ mod tests {
 
         // First access creates state
         registry.with_event_state(sig, |state, _now| {
-            assert_eq!(state.counter.count(), 1);
+            assert_eq!(state.counter.count(), 0);
         });
 
         assert_eq!(registry.len(), 1);

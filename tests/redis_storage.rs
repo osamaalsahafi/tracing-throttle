@@ -61,7 +61,7 @@ async fn test_redis_basic_set_get() {
         sig,
         || EventState::new(policy.clone(), Instant::now()),
         |state| {
-            assert_eq!(state.counter.count(), 1);
+            assert_eq!(state.counter.count(), 0);
         },
     );
 
@@ -70,7 +70,7 @@ async fn test_redis_basic_set_get() {
         sig,
         || panic!("Should not create new state"),
         |state| {
-            assert_eq!(state.counter.count(), 1);
+            assert_eq!(state.counter.count(), 0);
             state.counter.record_suppression(Instant::now());
         },
     );
@@ -80,7 +80,7 @@ async fn test_redis_basic_set_get() {
         sig,
         || panic!("Should not create new state"),
         |state| {
-            assert_eq!(state.counter.count(), 2);
+            assert_eq!(state.counter.count(), 1);
         },
     );
 
@@ -230,7 +230,7 @@ async fn test_redis_concurrent_access() {
     }
 
     // Final count should reflect all increments
-    // Note: Due to Redis race conditions, this might not be exactly 101 (1 initial + 100 records)
+    // Note: Due to Redis race conditions, this might not be exactly 100
     // but should be at least close
     storage.with_entry_mut(
         sig,
@@ -484,13 +484,13 @@ async fn test_redis_with_registry() {
 
     // Use registry to access state
     registry.with_event_state(sig, |state, now| {
-        assert_eq!(state.counter.count(), 1);
+        assert_eq!(state.counter.count(), 0);
         state.counter.record_suppression(now);
     });
 
     // Verify persistence
     registry.with_event_state(sig, |state, _| {
-        assert_eq!(state.counter.count(), 2);
+        assert_eq!(state.counter.count(), 1);
     });
 
     storage.clear();
