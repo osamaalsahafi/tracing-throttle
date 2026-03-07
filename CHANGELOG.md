@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-03-07
+
+### Thanks
+
+- [@CorMazz](https://github.com/CorMazz) for the detailed bug report in [#2](https://github.com/nootr/tracing-throttle/issues/2).
+
+### Fixed
+
+- **Off-by-one in suppression count**: `SuppressionCounter::new()` was initializing `suppressed_count` to `1` instead of `0`, causing the first suppressed event to be reported as "2 suppressed" instead of "1 suppressed".
+- **Recursive summary throttling**: The default summary formatter emitted via `tracing::warn!()` which went through the same throttle layer, causing infinite nesting. Summaries are now emitted with a dedicated internal target (`tracing_throttle::summary`) that is statically exempted from throttling.
+
 ## [0.4.1] - 2026-01-14
 
 ### Performance
