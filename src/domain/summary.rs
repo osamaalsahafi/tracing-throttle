@@ -35,11 +35,11 @@ impl Clone for SuppressionCounter {
 }
 
 impl SuppressionCounter {
-    /// Create a new counter with initial suppression.
+    /// Create a new counter (initially zero suppressions).
     pub fn new(initial_timestamp: Instant) -> Self {
         let nanos = Self::instant_to_nanos(initial_timestamp);
         Self {
-            suppressed_count: AtomicUsize::new(1),
+            suppressed_count: AtomicUsize::new(0),
             first_suppressed_nanos: AtomicU64::new(nanos),
             last_suppressed_nanos: AtomicU64::new(nanos),
         }
@@ -269,13 +269,13 @@ mod tests {
         let now = Instant::now();
         let counter = SuppressionCounter::new(now);
 
+        assert_eq!(counter.count(), 0);
+
+        counter.record_suppression(now);
         assert_eq!(counter.count(), 1);
 
         counter.record_suppression(now);
         assert_eq!(counter.count(), 2);
-
-        counter.record_suppression(now);
-        assert_eq!(counter.count(), 3);
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
 
         counter.record_suppression(now);
         counter.record_suppression(now);
-        assert_eq!(counter.count(), 3);
+        assert_eq!(counter.count(), 2);
 
         counter.reset(now);
         assert_eq!(counter.count(), 0);
@@ -322,7 +322,7 @@ mod tests {
         let summary = SuppressionSummary::from_counter(sig, &counter);
 
         assert_eq!(summary.signature, sig);
-        assert_eq!(summary.count, 2);
+        assert_eq!(summary.count, 1);
         assert!(summary.duration >= Duration::from_millis(10));
     }
 
@@ -336,7 +336,7 @@ mod tests {
         let summary = SuppressionSummary::from_counter(sig, &counter);
         let message = summary.format_message();
 
-        assert!(message.contains("suppressed 2 times"));
+        assert!(message.contains("suppressed 1 times"));
         assert!(message.contains(&sig.to_string()));
     }
 
@@ -351,7 +351,7 @@ mod tests {
             counter.record_suppression(now);
         }
 
-        assert_eq!(counter.count(), 10_001); // 10,000 + 1 initial
+        assert_eq!(counter.count(), 10_000);
     }
 
     #[test]
@@ -378,8 +378,8 @@ mod tests {
             handle.join().unwrap();
         }
 
-        // 10 threads * 100 updates + 1 initial = 1001
-        assert_eq!(counter.count(), 1001);
+        // 10 threads * 100 updates = 1000
+        assert_eq!(counter.count(), 1000);
     }
 
     #[test]
@@ -391,7 +391,7 @@ mod tests {
         // Immediately create summary (same timestamp)
         let summary = SuppressionSummary::from_counter(sig, &counter);
 
-        assert_eq!(summary.count, 1);
+        assert_eq!(summary.count, 0);
         assert!(summary.duration < Duration::from_millis(1));
     }
 
@@ -401,7 +401,7 @@ mod tests {
         let counter = SuppressionCounter::new(now);
 
         counter.record_suppression(now);
-        assert_eq!(counter.count(), 2);
+        assert_eq!(counter.count(), 1);
 
         counter.reset(now);
         assert_eq!(counter.count(), 0);
@@ -440,8 +440,8 @@ mod tests {
         counter1.record_suppression(now);
 
         // counter2 should not be affected
-        assert_eq!(counter1.count(), 2);
-        assert_eq!(counter2.count(), 1);
+        assert_eq!(counter1.count(), 1);
+        assert_eq!(counter2.count(), 0);
     }
 
     #[test]
@@ -535,7 +535,7 @@ mod tests {
             counter.record_suppression(now);
         }
 
-        assert_eq!(counter.count(), 100_001);
+        assert_eq!(counter.count(), 100_000);
     }
 
     #[test]
@@ -579,7 +579,7 @@ mod tests {
         // Should not panic, timestamps should saturate gracefully
         let _first = counter.first_suppressed();
         let _last = counter.last_suppressed();
-        assert!(counter.count() > 1);
+        assert!(counter.count() > 0);
     }
 
     #[test]
@@ -631,7 +631,7 @@ mod tests {
         let counter_clone2 = Arc::clone(&counter);
         let done_clone2 = Arc::clone(&done);
         let reader = thread::spawn(move || {
-            let mut last_count = 1;
+            let mut last_count = 0;
             while !done_clone2.load(Ordering::Acquire) {
                 let count = counter_clone2.count();
                 // Count should never decrease
@@ -644,8 +644,8 @@ mod tests {
         writer.join().unwrap();
         reader.join().unwrap();
 
-        // Final count should be 101 (1 initial + 100 recorded)
-        assert_eq!(counter.count(), 101);
+        // Final count should be 100
+        assert_eq!(counter.count(), 100);
     }
 
     #[test]
@@ -657,7 +657,7 @@ mod tests {
         // Create summary immediately - same timestamp for first and last
         let summary = SuppressionSummary::from_counter(sig, &counter);
 
-        assert_eq!(summary.count, 1);
+        assert_eq!(summary.count, 0);
         assert_eq!(summary.duration, Duration::from_secs(0));
         assert_eq!(summary.first_suppressed, summary.last_suppressed);
     }

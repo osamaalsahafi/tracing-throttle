@@ -25,6 +25,14 @@ use tracing_subscriber::layer::Filter;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{layer::Context, Layer};
 
+/// Internal target used for summary emission events.
+///
+/// Events emitted with this target are automatically exempt from throttling to
+/// prevent recursive suppression of summary messages. This target is intentionally
+/// internal and not part of the public API.
+#[cfg(feature = "async")]
+const SUMMARY_TARGET: &str = "tracing_throttle::summary";
+
 #[cfg(feature = "async")]
 use crate::application::emitter::{EmitterHandle, SummaryEmitter};
 
@@ -544,6 +552,7 @@ impl TracingRateLimitLayerBuilder {
             let formatter = self.summary_formatter.unwrap_or_else(|| {
                 Arc::new(|summary: &SuppressionSummary| {
                     tracing::warn!(
+                        target: SUMMARY_TARGET,
                         signature = %summary.signature,
                         count = summary.count,
                         "{}",
@@ -907,10 +916,19 @@ where
 
     fn event_enabled(&self, event: &tracing::Event<'_>, cx: &Context<'_, Sub>) -> bool {
         let metadata_obj = event.metadata();
+        let target = metadata_obj.target();
+
+        // Exempt our internal summary emission target to prevent recursive throttling.
+        // Only the default formatter uses this target; custom formatters are the user's
+        // responsibility and are intentionally subject to normal throttling rules.
+        #[cfg(feature = "async")]
+        if target == SUMMARY_TARGET {
+            return true;
+        }
 
         // Check if this target is exempt from rate limiting
         // Skip the lookup if no exempt targets are configured (common case)
-        if !self.exempt_targets.is_empty() && self.exempt_targets.contains(metadata_obj.target()) {
+        if !self.exempt_targets.is_empty() && self.exempt_targets.contains(target) {
             // Exempt targets bypass rate limiting entirely
             self.limiter.metrics().record_allowed();
             return true;
@@ -938,7 +956,7 @@ where
             let event_metadata = crate::domain::metadata::EventMetadata::new(
                 metadata_obj.level().as_str().to_string(),
                 message,
-                metadata_obj.target().to_string(),
+                target.to_string(),
                 combined_fields,
             );
 
@@ -1585,5 +1603,48 @@ mod tests {
         assert!(count > 0, "Default formatter should have emitted summaries");
 
         handle.shutdown().await.expect("shutdown failed");
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_summary_emission_not_recursively_throttled() {
+        use std::time::Duration;
+
+        // Build a layer with active emission and a very restrictive policy
+        let layer = TracingRateLimitLayer::builder()
+            .with_policy(Policy::count_based(1).unwrap())
+            .with_active_emission(true)
+            .with_summary_interval(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let layer_clone = layer.clone();
+
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(layer));
+
+        // Emit events to trigger suppressions, then wait for multiple summary intervals.
+        // If summaries were recursively throttled, the second interval would produce
+        // nested "Suppressed 1 times: ... Suppressed N times: ..." messages and the
+        // signature count would keep growing.
+        tracing::subscriber::with_default(subscriber, || {
+            // Trigger suppressions
+            for _ in 0..5 {
+                tracing::info!(target: "myapp", "repetitive event");
+            }
+        });
+
+        // Wait for two summary intervals
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Signature count should be exactly 1 (the "myapp" event).
+        // If summary events were being throttled, additional signatures would appear.
+        assert_eq!(
+            layer_clone.signature_count(),
+            1,
+            "Summary emissions should not create additional throttle signatures"
+        );
+
+        layer_clone.shutdown().await.expect("shutdown failed");
     }
 }

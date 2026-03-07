@@ -306,9 +306,9 @@ mod tests {
         assert_eq!(limiter.check_event(sig), LimitDecision::Suppress);
         assert_eq!(limiter.check_event(sig), LimitDecision::Suppress);
 
-        // Check counter - initial creation counts as 1, plus 3 recorded = 4 total
+        // Check counter - 3 suppressions recorded
         registry.with_event_state(sig, |state, _now| {
-            assert_eq!(state.counter.count(), 4);
+            assert_eq!(state.counter.count(), 3);
         });
     }
 
@@ -608,7 +608,7 @@ mod tests {
 
         // Verify state exists
         let initial_count = registry.with_event_state(sig, |state, _| state.counter.count());
-        assert_eq!(initial_count, 1);
+        assert_eq!(initial_count, 0);
 
         // Open circuit breaker
         for _ in 0..10 {
