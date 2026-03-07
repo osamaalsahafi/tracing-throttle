@@ -17,8 +17,6 @@ use crate::infrastructure::storage::ShardedStorage;
 use crate::infrastructure::visitor::FieldVisitor;
 
 use std::borrow::Cow;
-#[cfg(feature = "async")]
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,32 +25,13 @@ use tracing_subscriber::layer::Filter;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{layer::Context, Layer};
 
+/// Internal target used for summary emission events.
+///
+/// Events emitted with this target are automatically exempt from throttling to
+/// prevent recursive suppression of summary messages. This target is intentionally
+/// internal and not part of the public API.
 #[cfg(feature = "async")]
-thread_local! {
-    /// Guard against re-entrant event processing (e.g., summary emissions triggering throttling).
-    /// Only relevant when active emission is enabled, since summary formatters emit tracing
-    /// events that would otherwise be recursively throttled on the same thread.
-    static IN_THROTTLE: Cell<bool> = const { Cell::new(false) };
-}
-
-/// RAII guard that resets IN_THROTTLE to false on drop, even during panics.
-#[cfg(feature = "async")]
-struct ThrottleGuard;
-
-#[cfg(feature = "async")]
-impl ThrottleGuard {
-    fn enter() -> Self {
-        IN_THROTTLE.with(|flag| flag.set(true));
-        ThrottleGuard
-    }
-}
-
-#[cfg(feature = "async")]
-impl Drop for ThrottleGuard {
-    fn drop(&mut self) {
-        IN_THROTTLE.with(|flag| flag.set(false));
-    }
-}
+const SUMMARY_TARGET: &str = "tracing_throttle::summary";
 
 #[cfg(feature = "async")]
 use crate::application::emitter::{EmitterHandle, SummaryEmitter};
@@ -573,6 +552,7 @@ impl TracingRateLimitLayerBuilder {
             let formatter = self.summary_formatter.unwrap_or_else(|| {
                 Arc::new(|summary: &SuppressionSummary| {
                     tracing::warn!(
+                        target: SUMMARY_TARGET,
                         signature = %summary.signature,
                         count = summary.count,
                         "{}",
@@ -583,7 +563,6 @@ impl TracingRateLimitLayerBuilder {
 
             let handle = emitter.start(
                 move |summaries| {
-                    let _guard = ThrottleGuard::enter();
                     for summary in summaries {
                         formatter(&summary);
                     }
@@ -936,17 +915,19 @@ where
     }
 
     fn event_enabled(&self, event: &tracing::Event<'_>, cx: &Context<'_, Sub>) -> bool {
-        // Prevent re-entrant throttling (e.g., summary emissions triggering throttling)
+        let metadata_obj = event.metadata();
+        let target = metadata_obj.target();
+
+        // Exempt our internal summary emission target to prevent recursive throttling.
+        // Only the default formatter uses this target; custom formatters are the user's
+        // responsibility and are intentionally subject to normal throttling rules.
         #[cfg(feature = "async")]
-        if IN_THROTTLE.with(|flag| flag.get()) {
+        if target == SUMMARY_TARGET {
             return true;
         }
 
-        let metadata_obj = event.metadata();
-
         // Check if this target is exempt from rate limiting
         // Skip the lookup if no exempt targets are configured (common case)
-        let target = metadata_obj.target();
         if !self.exempt_targets.is_empty() && self.exempt_targets.contains(target) {
             // Exempt targets bypass rate limiting entirely
             self.limiter.metrics().record_allowed();
@@ -975,7 +956,7 @@ where
             let event_metadata = crate::domain::metadata::EventMetadata::new(
                 metadata_obj.level().as_str().to_string(),
                 message,
-                metadata_obj.target().to_string(),
+                target.to_string(),
                 combined_fields,
             );
 
