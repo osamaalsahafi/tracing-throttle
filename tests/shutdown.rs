@@ -97,9 +97,19 @@ async fn test_explicit_shutdown_required() {
 #[tokio::test]
 async fn test_explicit_shutdown_in_application() {
     // Simulate an application with explicit shutdown
+    type Registry = tracing_throttle::SuppressionRegistry<
+        Arc<
+            tracing_throttle::ShardedStorage<
+                tracing_throttle::EventSignature,
+                tracing_throttle::application::registry::EventState,
+            >,
+        >,
+    >;
+
     struct Application {
         _emitter_handle: Option<EmitterHandle>,
         emissions: Arc<Mutex<Vec<usize>>>,
+        registry: Registry,
     }
 
     impl Application {
@@ -121,8 +131,10 @@ async fn test_explicit_shutdown_in_application() {
                 Duration::from_millis(100),
             )
             .unwrap();
-            let emitter =
-                tracing_throttle::application::emitter::SummaryEmitter::new(registry, config);
+            let emitter = tracing_throttle::application::emitter::SummaryEmitter::new(
+                registry.clone(),
+                config,
+            );
 
             let emissions = Arc::new(Mutex::new(Vec::new()));
             let emissions_clone = Arc::clone(&emissions);
@@ -137,7 +149,15 @@ async fn test_explicit_shutdown_in_application() {
             Self {
                 _emitter_handle: Some(handle),
                 emissions,
+                registry,
             }
+        }
+
+        fn record_suppression(&self) {
+            let sig = tracing_throttle::EventSignature::simple("INFO", "App event");
+            self.registry.with_event_state(sig, |state, now| {
+                state.counter.record_suppression(now);
+            });
         }
 
         async fn shutdown(mut self) {
@@ -153,8 +173,11 @@ async fn test_explicit_shutdown_in_application() {
 
     let app = Application::new();
 
-    // Let it run
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Let it run, with new suppressions arriving between intervals
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        app.record_suppression();
+    }
 
     let emissions_before = app.emission_count();
     assert!(emissions_before >= 2);

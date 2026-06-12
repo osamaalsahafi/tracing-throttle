@@ -68,6 +68,19 @@ pub trait RateLimitPolicy: Send + Sync {
     ///
     /// Called when starting a new tracking period or when clearing history.
     fn reset(&mut self);
+
+    /// Whether an `Allow` decision marks the end of a suppression episode.
+    ///
+    /// For policies like time windows or exponential backoff, suppression
+    /// happens in episodes: once an event is allowed again, the preceding
+    /// run of suppressions is over and can be summarized as one unit.
+    ///
+    /// For policies where allows and suppressions naturally interleave under
+    /// sustained load (e.g. token bucket), an `Allow` carries no such meaning,
+    /// so this returns `false` (the default).
+    fn allow_ends_episode(&self) -> bool {
+        false
+    }
 }
 
 /// Count-based rate limiting policy.
@@ -367,6 +380,10 @@ impl RateLimitPolicy for TimeWindowPolicy {
         }
     }
 
+    fn allow_ends_episode(&self) -> bool {
+        true
+    }
+
     fn reset(&mut self) {
         self.event_timestamps.clear();
     }
@@ -428,6 +445,10 @@ impl RateLimitPolicy for ExponentialBackoffPolicy {
     fn reset(&mut self) {
         self.event_count = 0;
         self.next_allowed = 1;
+    }
+
+    fn allow_ends_episode(&self) -> bool {
+        true
     }
 }
 
@@ -758,6 +779,15 @@ impl RateLimitPolicy for Policy {
             Policy::TimeWindow(p) => p.reset(),
             Policy::ExponentialBackoff(p) => p.reset(),
             Policy::TokenBucket(p) => p.reset(),
+        }
+    }
+
+    fn allow_ends_episode(&self) -> bool {
+        match self {
+            Policy::CountBased(p) => p.allow_ends_episode(),
+            Policy::TimeWindow(p) => p.allow_ends_episode(),
+            Policy::ExponentialBackoff(p) => p.allow_ends_episode(),
+            Policy::TokenBucket(p) => p.allow_ends_episode(),
         }
     }
 }

@@ -30,13 +30,11 @@ use tracing_subscriber::{layer::Context, Layer};
 /// Events emitted with this target are automatically exempt from throttling to
 /// prevent recursive suppression of summary messages. This target is intentionally
 /// internal and not part of the public API.
-#[cfg(feature = "async")]
 const SUMMARY_TARGET: &str = "tracing_throttle::summary";
 
 #[cfg(feature = "async")]
 use crate::application::emitter::{EmitterHandle, SummaryEmitter};
 
-#[cfg(feature = "async")]
 use crate::domain::summary::SuppressionSummary;
 
 #[cfg(feature = "async")]
@@ -46,8 +44,21 @@ use std::sync::Mutex;
 ///
 /// Takes a reference to a `SuppressionSummary` and emits it as a tracing event.
 /// The function is responsible for choosing the log level and format.
-#[cfg(feature = "async")]
 pub type SummaryFormatter = Arc<dyn Fn(&SuppressionSummary) + Send + Sync + 'static>;
+
+/// Default summary formatter: WARN level with `signature` and `count` fields,
+/// emitted under the throttling-exempt internal summary target.
+fn default_summary_formatter() -> SummaryFormatter {
+    Arc::new(|summary: &SuppressionSummary| {
+        tracing::warn!(
+            target: SUMMARY_TARGET,
+            signature = %summary.signature,
+            count = summary.count,
+            "{}",
+            summary.format_message()
+        );
+    })
+}
 
 /// Error returned when building a TracingRateLimitLayer fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +97,6 @@ pub struct TracingRateLimitLayerBuilder {
     clock: Option<Arc<dyn Clock>>,
     max_signatures: Option<usize>,
     enable_active_emission: bool,
-    #[cfg(feature = "async")]
     summary_formatter: Option<SummaryFormatter>,
     span_context_fields: Vec<String>,
     excluded_fields: BTreeSet<String>,
@@ -262,7 +272,9 @@ impl TracingRateLimitLayerBuilder {
     /// The formatter is responsible for emitting summaries as tracing events.
     /// This allows full control over log level, message format, and structured fields.
     ///
-    /// **Requires the `async` feature.**
+    /// The formatter is used both for periodic summaries (active emission,
+    /// requires the `async` feature) and for episode-end summaries emitted
+    /// when a policy allows an event again after a run of suppressions.
     ///
     /// If not set, a default formatter is used that emits at WARN level with
     /// `signature` and `count` fields.
@@ -286,7 +298,6 @@ impl TracingRateLimitLayerBuilder {
     ///     .build()
     ///     .unwrap();
     /// ```
-    #[cfg(feature = "async")]
     pub fn with_summary_formatter(mut self, formatter: SummaryFormatter) -> Self {
         self.summary_formatter = Some(formatter);
         self
@@ -544,27 +555,20 @@ impl TracingRateLimitLayerBuilder {
         // Let EmitterConfig validate the interval
         let emitter_config = EmitterConfig::new(self.summary_interval)?;
 
+        // Use custom formatter or default
+        let formatter = self
+            .summary_formatter
+            .unwrap_or_else(default_summary_formatter);
+
         #[cfg(feature = "async")]
         let emitter_handle = if self.enable_active_emission {
             let emitter = SummaryEmitter::new(registry, emitter_config);
 
-            // Use custom formatter or default
-            let formatter = self.summary_formatter.unwrap_or_else(|| {
-                Arc::new(|summary: &SuppressionSummary| {
-                    tracing::warn!(
-                        target: SUMMARY_TARGET,
-                        signature = %summary.signature,
-                        count = summary.count,
-                        "{}",
-                        summary.format_message()
-                    );
-                })
-            });
-
+            let emitter_formatter = formatter.clone();
             let handle = emitter.start(
                 move |summaries| {
                     for summary in summaries {
-                        formatter(&summary);
+                        emitter_formatter(&summary);
                     }
                 },
                 false, // Don't emit final summaries on shutdown
@@ -579,6 +583,7 @@ impl TracingRateLimitLayerBuilder {
             span_context_fields: Arc::new(self.span_context_fields),
             excluded_fields: Arc::new(self.excluded_fields),
             exempt_targets: Arc::new(self.exempt_targets),
+            summary_formatter: formatter,
             #[cfg(feature = "async")]
             emitter_handle,
             #[cfg(not(feature = "async"))]
@@ -603,6 +608,7 @@ where
     span_context_fields: Arc<Vec<String>>,
     excluded_fields: Arc<BTreeSet<String>>,
     exempt_targets: Arc<BTreeSet<String>>,
+    summary_formatter: SummaryFormatter,
     #[cfg(feature = "async")]
     emitter_handle: Arc<Mutex<Option<EmitterHandle>>>,
     #[cfg(not(feature = "async"))]
@@ -703,14 +709,23 @@ where
     }
 
     /// Check if an event should be allowed through.
+    ///
+    /// When the policy treats an `Allow` as the end of a suppression episode
+    /// (e.g. time window, exponential backoff), a summary of the suppressions
+    /// that have not yet been reported is emitted through the summary formatter.
     pub fn should_allow(&self, signature: EventSignature) -> bool {
-        matches!(self.limiter.check_event(signature), LimitDecision::Allow)
+        let (decision, episode) = self.limiter.check_event_with_summary(signature);
+        if let Some(summary) = episode {
+            (self.summary_formatter)(&summary);
+        }
+        matches!(decision, LimitDecision::Allow)
     }
 
     /// Check if an event should be allowed through and capture metadata.
     ///
     /// This method stores event metadata on first occurrence so summaries
     /// can show human-readable event details instead of just signature hashes.
+    /// Episode-end summaries are emitted like in [`should_allow`](Self::should_allow).
     ///
     /// **Note:** Only available with the `human-readable` feature flag.
     #[cfg(feature = "human-readable")]
@@ -719,10 +734,13 @@ where
         signature: EventSignature,
         metadata: crate::domain::metadata::EventMetadata,
     ) -> bool {
-        matches!(
-            self.limiter.check_event_with_metadata(signature, metadata),
-            LimitDecision::Allow
-        )
+        let (decision, episode) = self
+            .limiter
+            .check_event_with_metadata_and_summary(signature, metadata);
+        if let Some(summary) = episode {
+            (self.summary_formatter)(&summary);
+        }
+        matches!(decision, LimitDecision::Allow)
     }
 
     /// Get a reference to the underlying limiter.
@@ -813,7 +831,6 @@ impl TracingRateLimitLayer<Arc<ShardedStorage<EventSignature, EventState>>> {
             clock: None,
             max_signatures: Some(10_000),
             enable_active_emission: false,
-            #[cfg(feature = "async")]
             summary_formatter: None,
             span_context_fields: Vec::new(),
             excluded_fields: BTreeSet::new(),
@@ -887,6 +904,7 @@ impl TracingRateLimitLayer<Arc<ShardedStorage<EventSignature, EventState>>> {
             span_context_fields: Arc::new(Vec::new()),
             excluded_fields: Arc::new(BTreeSet::new()),
             exempt_targets: Arc::new(BTreeSet::new()),
+            summary_formatter: default_summary_formatter(),
             #[cfg(feature = "async")]
             emitter_handle: Arc::new(Mutex::new(None)),
             #[cfg(not(feature = "async"))]
@@ -921,7 +939,6 @@ where
         // Exempt our internal summary emission target to prevent recursive throttling.
         // Only the default formatter uses this target; custom formatters are the user's
         // responsibility and are intentionally subject to normal throttling rules.
-        #[cfg(feature = "async")]
         if target == SUMMARY_TARGET {
             return true;
         }
@@ -1363,6 +1380,7 @@ mod tests {
             span_context_fields: Arc::new(Vec::new()),
             excluded_fields: Arc::new(BTreeSet::new()),
             exempt_targets: Arc::new(BTreeSet::new()),
+            summary_formatter: default_summary_formatter(),
             #[cfg(feature = "async")]
             emitter_handle: Arc::new(Mutex::new(None)),
             #[cfg(not(feature = "async"))]
@@ -1563,6 +1581,55 @@ mod tests {
         );
 
         layer.shutdown().await.expect("shutdown failed");
+    }
+
+    /// Regression test for issue #4: episode-ending allows emit one summary
+    /// of the suppressions, and quiet periods produce no further output.
+    #[test]
+    fn test_episode_end_summary_emission() {
+        use crate::infrastructure::mocks::MockClock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex as StdMutex;
+        use std::time::{Duration, Instant};
+
+        let mock_clock = Arc::new(MockClock::new(Instant::now()));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&call_count);
+        let last_summary_count = Arc::new(StdMutex::new(0usize));
+        let last_summary_clone = Arc::clone(&last_summary_count);
+
+        let layer = TracingRateLimitLayer::builder()
+            .with_policy(Policy::time_window(1, Duration::from_secs(60)).unwrap())
+            .with_clock(mock_clock.clone())
+            .with_summary_formatter(Arc::new(move |summary| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                *last_summary_clone.lock().unwrap() = summary.count;
+            }))
+            .build()
+            .unwrap();
+
+        let sig = EventSignature::simple("INFO", "Initialization step");
+
+        // 1 allowed, 9 suppressed
+        assert!(layer.should_allow(sig));
+        for _ in 0..9 {
+            assert!(!layer.should_allow(sig));
+        }
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+
+        // Window rolls over: the allowing event closes the episode
+        mock_clock.advance(Duration::from_secs(61));
+        assert!(layer.should_allow(sig));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(*last_summary_count.lock().unwrap(), 9);
+
+        // Quiet windows produce no repeated summaries
+        mock_clock.advance(Duration::from_secs(61));
+        assert!(layer.should_allow(sig));
+        mock_clock.advance(Duration::from_secs(61));
+        assert!(layer.should_allow(sig));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(feature = "async")]

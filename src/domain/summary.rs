@@ -18,6 +18,10 @@ pub struct SuppressionCounter {
     first_suppressed_nanos: AtomicU64,
     /// Timestamp of last suppression (nanoseconds since epoch)
     last_suppressed_nanos: AtomicU64,
+    /// Number of suppressions already included in an emitted summary
+    reported_count: AtomicUsize,
+    /// Timestamp marking the end of the last reported range (nanoseconds since epoch)
+    reported_boundary_nanos: AtomicU64,
 }
 
 impl Clone for SuppressionCounter {
@@ -30,8 +34,23 @@ impl Clone for SuppressionCounter {
             last_suppressed_nanos: AtomicU64::new(
                 self.last_suppressed_nanos.load(Ordering::Relaxed),
             ),
+            reported_count: AtomicUsize::new(self.reported_count.load(Ordering::Relaxed)),
+            reported_boundary_nanos: AtomicU64::new(
+                self.reported_boundary_nanos.load(Ordering::Relaxed),
+            ),
         }
     }
+}
+
+/// A claimed range of suppressions that had not yet been reported in a summary.
+#[derive(Debug, Clone, Copy)]
+pub struct UnreportedSuppressions {
+    /// Number of suppressions in this range
+    pub count: usize,
+    /// Start of the range (end of the previously reported range)
+    pub since: Instant,
+    /// End of the range (most recent suppression)
+    pub until: Instant,
 }
 
 impl SuppressionCounter {
@@ -42,6 +61,8 @@ impl SuppressionCounter {
             suppressed_count: AtomicUsize::new(0),
             first_suppressed_nanos: AtomicU64::new(nanos),
             last_suppressed_nanos: AtomicU64::new(nanos),
+            reported_count: AtomicUsize::new(0),
+            reported_boundary_nanos: AtomicU64::new(nanos),
         }
     }
 
@@ -60,6 +81,8 @@ impl SuppressionCounter {
             suppressed_count: AtomicUsize::new(suppressed_count),
             first_suppressed_nanos: AtomicU64::new(first_nanos),
             last_suppressed_nanos: AtomicU64::new(last_nanos),
+            reported_count: AtomicUsize::new(0),
+            reported_boundary_nanos: AtomicU64::new(first_nanos),
         }
     }
 
@@ -119,6 +142,47 @@ impl SuppressionCounter {
         self.suppressed_count.store(0, Ordering::Release);
         self.first_suppressed_nanos.store(nanos, Ordering::Release);
         self.last_suppressed_nanos.store(nanos, Ordering::Release);
+        self.reported_count.store(0, Ordering::Release);
+        self.reported_boundary_nanos.store(nanos, Ordering::Release);
+    }
+
+    /// Get the number of suppressions already covered by an emitted summary.
+    pub fn reported(&self) -> usize {
+        self.reported_count.load(Ordering::Acquire)
+    }
+
+    /// Atomically claim all suppressions not yet covered by an emitted summary.
+    ///
+    /// Advances the reported mark to the current count and returns the newly
+    /// claimed range, or `None` if there is nothing new to report.
+    ///
+    /// # Thread Safety
+    ///
+    /// The mark is advanced with `fetch_max`, so if two reporters race, exactly
+    /// one of them claims each suppression: the loser observes an already-advanced
+    /// mark and gets `None`. A suppression recorded concurrently with a claim is
+    /// never lost — it is picked up by the next claim.
+    pub fn claim_unreported(&self) -> Option<UnreportedSuppressions> {
+        let count = self.suppressed_count.load(Ordering::Acquire);
+        if count == 0 {
+            return None;
+        }
+
+        let previously_reported = self.reported_count.fetch_max(count, Ordering::AcqRel);
+        if previously_reported >= count {
+            return None;
+        }
+
+        let since_nanos = self.reported_boundary_nanos.load(Ordering::Acquire);
+        let until = self.last_suppressed();
+        self.reported_boundary_nanos
+            .store(Self::instant_to_nanos(until), Ordering::Release);
+
+        Some(UnreportedSuppressions {
+            count: count - previously_reported,
+            since: Self::nanos_to_instant(since_nanos),
+            until,
+        })
     }
 
     /// Get the shared base instant for timestamp calculations.
@@ -224,6 +288,25 @@ impl SuppressionSummary {
         }
     }
 
+    /// Create a summary from a claimed range of unreported suppressions.
+    ///
+    /// `count` and `duration` describe only the claimed range, not the
+    /// all-time totals of the counter.
+    pub fn from_unreported(
+        signature: EventSignature,
+        unreported: UnreportedSuppressions,
+        metadata: Option<EventMetadata>,
+    ) -> Self {
+        Self {
+            signature,
+            count: unreported.count,
+            first_suppressed: unreported.since,
+            last_suppressed: unreported.until,
+            duration: unreported.until.saturating_duration_since(unreported.since),
+            metadata,
+        }
+    }
+
     /// Format the summary as a human-readable message.
     ///
     /// If metadata is available, includes event details.
@@ -308,6 +391,108 @@ mod tests {
 
         counter.reset(now);
         assert_eq!(counter.count(), 0);
+    }
+
+    #[test]
+    fn test_claim_unreported_basic() {
+        let now = Instant::now();
+        let counter = SuppressionCounter::new(now);
+
+        // Nothing to claim on a fresh counter
+        assert!(counter.claim_unreported().is_none());
+
+        counter.record_suppression(now + Duration::from_secs(1));
+        counter.record_suppression(now + Duration::from_secs(2));
+
+        let claim = counter.claim_unreported().expect("should claim 2");
+        assert_eq!(claim.count, 2);
+        assert_eq!(counter.reported(), 2);
+
+        // Nothing new to claim until further suppressions occur
+        assert!(counter.claim_unreported().is_none());
+
+        counter.record_suppression(now + Duration::from_secs(3));
+        let claim = counter.claim_unreported().expect("should claim delta");
+        assert_eq!(claim.count, 1);
+        assert!(counter.claim_unreported().is_none());
+    }
+
+    #[test]
+    fn test_claim_unreported_range_timestamps() {
+        let now = Instant::now();
+        let counter = SuppressionCounter::new(now);
+
+        counter.record_suppression(now + Duration::from_secs(2));
+        let claim = counter.claim_unreported().unwrap();
+        // First claim spans from counter creation to last suppression
+        assert_eq!(claim.since, now);
+        assert_eq!(claim.until, now + Duration::from_secs(2));
+
+        counter.record_suppression(now + Duration::from_secs(5));
+        let claim = counter.claim_unreported().unwrap();
+        // Subsequent claims start at the previous claim's boundary
+        assert_eq!(claim.since, now + Duration::from_secs(2));
+        assert_eq!(claim.until, now + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_claim_unreported_concurrent_single_winner() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let now = Instant::now();
+        let counter = Arc::new(SuppressionCounter::new(now));
+        for _ in 0..100 {
+            counter.record_suppression(now);
+        }
+
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let counter = Arc::clone(&counter);
+            handles.push(thread::spawn(move || {
+                counter.claim_unreported().map_or(0, |c| c.count)
+            }));
+        }
+
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        // Every suppression is claimed exactly once across racing reporters
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn test_reset_clears_reported() {
+        let now = Instant::now();
+        let counter = SuppressionCounter::new(now);
+
+        counter.record_suppression(now);
+        counter.claim_unreported().unwrap();
+        assert_eq!(counter.reported(), 1);
+
+        counter.reset(now);
+        assert_eq!(counter.reported(), 0);
+        assert!(counter.claim_unreported().is_none());
+    }
+
+    #[test]
+    fn test_summary_from_unreported() {
+        let sig = EventSignature::simple("INFO", "Test");
+        let now = Instant::now();
+        let counter = SuppressionCounter::new(now);
+
+        for i in 1..=9 {
+            counter.record_suppression(now + Duration::from_secs(i));
+        }
+        counter.claim_unreported().unwrap();
+
+        for i in 10..=12 {
+            counter.record_suppression(now + Duration::from_secs(i));
+        }
+        let claim = counter.claim_unreported().unwrap();
+        let summary = SuppressionSummary::from_unreported(sig, claim, None);
+
+        assert_eq!(summary.count, 3);
+        assert_eq!(summary.duration, Duration::from_secs(3));
+        assert_eq!(summary.signature, sig);
     }
 
     #[test]

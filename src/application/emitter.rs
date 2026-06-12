@@ -279,7 +279,8 @@ where
     /// Collect current suppression summaries.
     ///
     /// Returns summaries for all events that have been suppressed at least
-    /// `min_count` times.
+    /// `min_count` times. This is a pure snapshot of all-time totals: it does
+    /// not mark anything as reported and does not affect periodic emission.
     pub fn collect_summaries(&self) -> Vec<SuppressionSummary> {
         let mut summaries = Vec::new();
         let min_count = self.config.min_count;
@@ -305,6 +306,40 @@ where
         summaries
     }
 
+    /// Collect summaries for suppressions that have not been reported yet,
+    /// marking them as reported.
+    ///
+    /// Unlike [`collect_summaries`](Self::collect_summaries), each summary
+    /// describes only the suppressions that occurred since the previous report
+    /// (periodic or episode-end). Signatures with no new suppressions are
+    /// skipped entirely, so repeated calls without new activity return nothing.
+    ///
+    /// The `min_count` threshold applies to the all-time suppression count of
+    /// a signature, matching `collect_summaries`.
+    pub fn collect_unreported_summaries(&self) -> Vec<SuppressionSummary> {
+        let mut summaries = Vec::new();
+        let min_count = self.config.min_count;
+
+        self.registry.for_each(|signature, state| {
+            if state.counter.count() < min_count {
+                return;
+            }
+
+            if let Some(unreported) = state.counter.claim_unreported() {
+                #[cfg(feature = "human-readable")]
+                let metadata = state.metadata.clone();
+                #[cfg(not(feature = "human-readable"))]
+                let metadata = None;
+
+                summaries.push(SuppressionSummary::from_unreported(
+                    *signature, unreported, metadata,
+                ));
+            }
+        });
+
+        summaries
+    }
+
     /// Start emitting summaries periodically (async version).
     ///
     /// This spawns a background task that emits summaries at the configured interval.
@@ -321,7 +356,8 @@ where
     /// # Cancellation Safety
     ///
     /// The spawned task is cancellation-safe:
-    /// - `collect_summaries()` reads atomically from storage without mutations
+    /// - `collect_unreported_summaries()` only advances atomic report marks;
+    ///   no other storage state is mutated
     /// - If cancelled during emission, the next startup will see correct state
     /// - Panics in `emit_fn` are caught and don't abort the task
     /// - The `emit_fn` closure should be cancellation-safe (avoid holding locks across `.await`)
@@ -381,7 +417,7 @@ where
                         if *shutdown_rx.borrow_and_update() {
                             // Emit final summaries if requested
                             if emit_final {
-                                let summaries = self.collect_summaries();
+                                let summaries = self.collect_unreported_summaries();
                                 if !summaries.is_empty() {
                                     // Panic safety for final emission too
                                     // Note: summaries will be properly dropped even if emit_fn panics
@@ -399,7 +435,7 @@ where
                         }
                     }
                     _ = ticker.tick() => {
-                        let summaries = self.collect_summaries();
+                        let summaries = self.collect_unreported_summaries();
                         if !summaries.is_empty() {
                             // Panic safety: catch panics in emit_fn to prevent task abort
                             // Note: summaries will be properly dropped even if emit_fn panics
@@ -536,7 +572,7 @@ mod tests {
             state.counter.record_suppression(now);
         });
 
-        let emitter = SummaryEmitter::new(registry, config);
+        let emitter = SummaryEmitter::new(registry.clone(), config);
 
         // Track emissions
         let emissions = Arc::new(Mutex::new(Vec::new()));
@@ -549,14 +585,94 @@ mod tests {
             false,
         );
 
-        // Wait for a couple of intervals
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Keep recording new suppressions so multiple intervals have new data
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            registry.with_event_state(sig, |state, now| {
+                state.counter.record_suppression(now);
+            });
+        }
 
         handle.shutdown().await.expect("shutdown failed");
 
-        // Should have emitted at least once
+        // Should have emitted at least twice (new suppressions each interval)
         let emission_count = emissions.lock().unwrap().len();
         assert!(emission_count >= 2);
+    }
+
+    /// Regression test for issue #4: a suppressed signature must not be
+    /// re-reported on every interval when no new suppressions occurred.
+    #[test]
+    fn test_no_reemission_without_new_suppressions() {
+        let storage = Arc::new(ShardedStorage::new());
+        let clock = Arc::new(SystemClock::new());
+        let policy = Policy::count_based(100).unwrap();
+        let registry = SuppressionRegistry::new(storage, clock, policy);
+        let emitter = SummaryEmitter::new(registry.clone(), EmitterConfig::default());
+
+        let sig = EventSignature::simple("INFO", "Initialization step");
+        registry.with_event_state(sig, |state, now| {
+            for _ in 0..9 {
+                state.counter.record_suppression(now);
+            }
+        });
+
+        // First collection reports the 9 suppressions
+        let summaries = emitter.collect_unreported_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].count, 9);
+
+        // Subsequent collections with no new suppressions report nothing
+        assert!(emitter.collect_unreported_summaries().is_empty());
+        assert!(emitter.collect_unreported_summaries().is_empty());
+    }
+
+    #[test]
+    fn test_delta_counts_per_collection() {
+        let storage = Arc::new(ShardedStorage::new());
+        let clock = Arc::new(SystemClock::new());
+        let policy = Policy::count_based(100).unwrap();
+        let registry = SuppressionRegistry::new(storage, clock, policy);
+        let emitter = SummaryEmitter::new(registry.clone(), EmitterConfig::default());
+
+        let sig = EventSignature::simple("INFO", "Chatty");
+        registry.with_event_state(sig, |state, now| {
+            for _ in 0..9 {
+                state.counter.record_suppression(now);
+            }
+        });
+        assert_eq!(emitter.collect_unreported_summaries()[0].count, 9);
+
+        // Only the new suppressions are reported, not the all-time total
+        registry.with_event_state(sig, |state, now| {
+            for _ in 0..3 {
+                state.counter.record_suppression(now);
+            }
+        });
+        assert_eq!(emitter.collect_unreported_summaries()[0].count, 3);
+    }
+
+    #[test]
+    fn test_collect_summaries_remains_cumulative_snapshot() {
+        let storage = Arc::new(ShardedStorage::new());
+        let clock = Arc::new(SystemClock::new());
+        let policy = Policy::count_based(100).unwrap();
+        let registry = SuppressionRegistry::new(storage, clock, policy);
+        let emitter = SummaryEmitter::new(registry.clone(), EmitterConfig::default());
+
+        let sig = EventSignature::simple("INFO", "Test");
+        registry.with_event_state(sig, |state, now| {
+            for _ in 0..5 {
+                state.counter.record_suppression(now);
+            }
+        });
+
+        // Pure snapshot: repeated calls keep returning the all-time total
+        assert_eq!(emitter.collect_summaries()[0].count, 5);
+        assert_eq!(emitter.collect_summaries()[0].count, 5);
+
+        // And it does not interfere with delta collection
+        assert_eq!(emitter.collect_unreported_summaries()[0].count, 5);
     }
 
     #[test]
@@ -807,7 +923,7 @@ mod tests {
             }
         });
 
-        let emitter = SummaryEmitter::new(registry, config);
+        let emitter = SummaryEmitter::new(registry.clone(), config);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = Arc::clone(&call_count);
@@ -825,8 +941,14 @@ mod tests {
             false,
         );
 
-        // Let it emit multiple times - first should panic, rest should succeed
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Let it emit multiple times - first should panic, rest should succeed.
+        // Record new suppressions so each interval has something to emit.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            registry.with_event_state(sig, |state, now| {
+                state.counter.record_suppression(now);
+            });
+        }
 
         handle.shutdown().await.expect("shutdown failed");
 
@@ -854,7 +976,7 @@ mod tests {
             state.counter.record_suppression(now);
         });
 
-        let emitter = SummaryEmitter::new(registry, config);
+        let emitter = SummaryEmitter::new(registry.clone(), config);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = Arc::clone(&call_count);
@@ -867,8 +989,14 @@ mod tests {
             false,
         );
 
-        // Let it run and panic multiple times
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Let it run and panic multiple times, recording new suppressions
+        // so each interval has something to emit
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            registry.with_event_state(sig, |state, now| {
+                state.counter.record_suppression(now);
+            });
+        }
 
         handle.shutdown().await.expect("shutdown failed");
 

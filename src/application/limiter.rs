@@ -8,12 +8,11 @@ use crate::application::metrics::Metrics;
 use crate::application::ports::Storage;
 use crate::application::registry::SuppressionRegistry;
 use crate::domain::{
+    metadata::EventMetadata,
     policy::{PolicyDecision, RateLimitPolicy},
     signature::EventSignature,
+    summary::SuppressionSummary,
 };
-
-#[cfg(feature = "human-readable")]
-use crate::domain::metadata::EventMetadata;
 use std::panic;
 use std::sync::Arc;
 
@@ -77,50 +76,21 @@ where
     /// - Lock-free atomic operations where possible
     /// - No allocations in common case
     pub fn check_event(&self, signature: EventSignature) -> LimitDecision {
-        // Check circuit breaker state
-        if !self.circuit_breaker.allow_request() {
-            // Circuit is open, fail open (allow all events)
-            self.metrics.record_allowed();
-            return LimitDecision::Allow;
-        }
+        self.check_event_inner(signature, None, false).0
+    }
 
-        // Attempt rate limiting operation with panic protection
-        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            self.registry.with_event_state(signature, |state, now| {
-                // Ask the policy whether to allow this event
-                let decision = state.policy.register_event(now);
-
-                match decision {
-                    PolicyDecision::Allow => LimitDecision::Allow,
-                    PolicyDecision::Suppress => {
-                        // Record the suppression
-                        state.counter.record_suppression(now);
-                        LimitDecision::Suppress
-                    }
-                }
-            })
-        }));
-
-        let decision = match result {
-            Ok(decision) => {
-                // Operation succeeded
-                self.circuit_breaker.record_success();
-                decision
-            }
-            Err(_) => {
-                // Operation panicked, record failure and fail open
-                self.circuit_breaker.record_failure();
-                LimitDecision::Allow
-            }
-        };
-
-        // Record metrics
-        match decision {
-            LimitDecision::Allow => self.metrics.record_allowed(),
-            LimitDecision::Suppress => self.metrics.record_suppressed(),
-        }
-
-        decision
+    /// Process an event and, when the policy treats an `Allow` as the end of a
+    /// suppression episode, return a summary of the suppressions that have not
+    /// yet been reported.
+    ///
+    /// The returned summary's suppressions are marked as reported, so the
+    /// periodic emitter will not report them again. The caller is responsible
+    /// for actually emitting the summary.
+    pub fn check_event_with_summary(
+        &self,
+        signature: EventSignature,
+    ) -> (LimitDecision, Option<SuppressionSummary>) {
+        self.check_event_inner(signature, None, true)
     }
 
     /// Process an event with metadata and decide whether to allow or suppress it.
@@ -144,43 +114,91 @@ where
         signature: EventSignature,
         metadata: EventMetadata,
     ) -> LimitDecision {
+        self.check_event_inner(signature, Some(metadata), false).0
+    }
+
+    /// Like [`check_event_with_summary`](Self::check_event_with_summary), but
+    /// also captures event metadata on first occurrence.
+    ///
+    /// **Note:** Only available with the `human-readable` feature flag.
+    #[cfg(feature = "human-readable")]
+    pub fn check_event_with_metadata_and_summary(
+        &self,
+        signature: EventSignature,
+        metadata: EventMetadata,
+    ) -> (LimitDecision, Option<SuppressionSummary>) {
+        self.check_event_inner(signature, Some(metadata), true)
+    }
+
+    /// Shared implementation for all check variants.
+    ///
+    /// `close_episode` controls whether an episode-ending `Allow` claims the
+    /// unreported suppressions and returns them as a summary. Variants that
+    /// discard the summary must pass `false` so unreported suppressions stay
+    /// available to the periodic emitter.
+    fn check_event_inner(
+        &self,
+        signature: EventSignature,
+        metadata: Option<EventMetadata>,
+        close_episode: bool,
+    ) -> (LimitDecision, Option<SuppressionSummary>) {
+        #[cfg(not(feature = "human-readable"))]
+        let _ = metadata;
+
         // Check circuit breaker state
         if !self.circuit_breaker.allow_request() {
             // Circuit is open, fail open (allow all events)
             self.metrics.record_allowed();
-            return LimitDecision::Allow;
+            return (LimitDecision::Allow, None);
         }
 
         // Attempt rate limiting operation with panic protection
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             self.registry.with_event_state(signature, |state, now| {
                 // Capture metadata on first occurrence
-                state.set_metadata(metadata);
+                #[cfg(feature = "human-readable")]
+                if let Some(metadata) = metadata {
+                    state.set_metadata(metadata);
+                }
 
                 // Ask the policy whether to allow this event
                 let decision = state.policy.register_event(now);
 
                 match decision {
-                    PolicyDecision::Allow => LimitDecision::Allow,
+                    PolicyDecision::Allow => {
+                        let episode = if close_episode && state.policy.allow_ends_episode() {
+                            state.counter.claim_unreported().map(|unreported| {
+                                #[cfg(feature = "human-readable")]
+                                let metadata = state.metadata.clone();
+                                #[cfg(not(feature = "human-readable"))]
+                                let metadata = None;
+
+                                SuppressionSummary::from_unreported(signature, unreported, metadata)
+                            })
+                        } else {
+                            None
+                        };
+                        (LimitDecision::Allow, episode)
+                    }
                     PolicyDecision::Suppress => {
                         // Record the suppression
                         state.counter.record_suppression(now);
-                        LimitDecision::Suppress
+                        (LimitDecision::Suppress, None)
                     }
                 }
             })
         }));
 
-        let decision = match result {
-            Ok(decision) => {
+        let (decision, episode) = match result {
+            Ok(outcome) => {
                 // Operation succeeded
                 self.circuit_breaker.record_success();
-                decision
+                outcome
             }
             Err(_) => {
                 // Operation panicked, record failure and fail open
                 self.circuit_breaker.record_failure();
-                LimitDecision::Allow
+                (LimitDecision::Allow, None)
             }
         };
 
@@ -190,7 +208,7 @@ where
             LimitDecision::Suppress => self.metrics.record_suppressed(),
         }
 
-        decision
+        (decision, episode)
     }
 
     /// Get a reference to the registry.
@@ -364,6 +382,115 @@ mod tests {
 
         // Should have suppressed the rest
         assert!(total_suppressed >= 150);
+    }
+
+    #[test]
+    fn test_time_window_allow_closes_episode() {
+        use std::time::Duration;
+
+        let storage = Arc::new(ShardedStorage::new());
+        let mock_clock = Arc::new(MockClock::new(Instant::now()));
+        let policy = Policy::time_window(1, Duration::from_secs(60)).unwrap();
+        let registry = SuppressionRegistry::new(storage, mock_clock.clone(), policy);
+        let limiter = RateLimiter::new(registry, Metrics::new(), Arc::new(CircuitBreaker::new()));
+
+        let sig = EventSignature::simple("INFO", "Test");
+
+        // 1 allowed, 9 suppressed
+        assert_eq!(
+            limiter.check_event_with_summary(sig).0,
+            LimitDecision::Allow
+        );
+        for _ in 0..9 {
+            assert_eq!(
+                limiter.check_event_with_summary(sig).0,
+                LimitDecision::Suppress
+            );
+        }
+
+        // Window rolls over: the next Allow closes the episode
+        mock_clock.advance(Duration::from_secs(61));
+        let (decision, episode) = limiter.check_event_with_summary(sig);
+        assert_eq!(decision, LimitDecision::Allow);
+        let summary = episode.expect("episode summary expected");
+        assert_eq!(summary.count, 9);
+
+        // A new window without suppressions yields no episode summary
+        mock_clock.advance(Duration::from_secs(61));
+        let (decision, episode) = limiter.check_event_with_summary(sig);
+        assert_eq!(decision, LimitDecision::Allow);
+        assert!(episode.is_none());
+    }
+
+    #[test]
+    fn test_token_bucket_allow_does_not_close_episode() {
+        use std::time::Duration;
+
+        let storage = Arc::new(ShardedStorage::new());
+        let mock_clock = Arc::new(MockClock::new(Instant::now()));
+        let policy = Policy::token_bucket(1.0, 1.0).unwrap();
+        let registry = SuppressionRegistry::new(storage, mock_clock.clone(), policy);
+        let limiter = RateLimiter::new(
+            registry.clone(),
+            Metrics::new(),
+            Arc::new(CircuitBreaker::new()),
+        );
+
+        let sig = EventSignature::simple("INFO", "Test");
+
+        assert_eq!(
+            limiter.check_event_with_summary(sig).0,
+            LimitDecision::Allow
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                limiter.check_event_with_summary(sig).0,
+                LimitDecision::Suppress
+            );
+        }
+
+        // Refill a token: allows and suppressions interleave under sustained
+        // load, so an Allow must not claim the suppressions
+        mock_clock.advance(Duration::from_secs(1));
+        let (decision, episode) = limiter.check_event_with_summary(sig);
+        assert_eq!(decision, LimitDecision::Allow);
+        assert!(episode.is_none());
+
+        // The suppressions stay available for the periodic emitter
+        registry.with_event_state(sig, |state, _| {
+            assert_eq!(state.counter.count(), 5);
+            assert_eq!(state.counter.reported(), 0);
+        });
+    }
+
+    #[test]
+    fn test_check_event_does_not_claim_episode() {
+        use std::time::Duration;
+
+        let storage = Arc::new(ShardedStorage::new());
+        let mock_clock = Arc::new(MockClock::new(Instant::now()));
+        let policy = Policy::time_window(1, Duration::from_secs(60)).unwrap();
+        let registry = SuppressionRegistry::new(storage, mock_clock.clone(), policy);
+        let limiter = RateLimiter::new(
+            registry.clone(),
+            Metrics::new(),
+            Arc::new(CircuitBreaker::new()),
+        );
+
+        let sig = EventSignature::simple("INFO", "Test");
+
+        assert_eq!(limiter.check_event(sig), LimitDecision::Allow);
+        for _ in 0..3 {
+            limiter.check_event(sig);
+        }
+
+        // check_event discards no suppressions: they remain unreported
+        mock_clock.advance(Duration::from_secs(61));
+        assert_eq!(limiter.check_event(sig), LimitDecision::Allow);
+        registry.with_event_state(sig, |state, _| {
+            assert_eq!(state.counter.reported(), 0);
+            assert_eq!(state.counter.count(), 3);
+        });
     }
 
     #[test]
